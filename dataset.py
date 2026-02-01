@@ -25,6 +25,12 @@ class KITTIDataset:
         self.calib_matrix = self.load_calib()
         self.poses = self.load_poses()
 
+    def __len__(self):
+        """
+        Returns the length of images_files, which is the total number of images in the datapath.
+        """
+        return len(self.image_files)
+
     def load_calib(self) -> np.ndarray:
         """
         Parses the calibration file to extract the left camera projection matrix (P0)
@@ -80,6 +86,8 @@ if __name__ == "__main__":
     print(f"Calibration Matrix:\n{kitti.calib_matrix}")
     
     print(f"First Pose:\n{kitti.poses[0]}")
+
+    print(f"Length of dataset: {len(kitti)}")
     
     cv.imshow("Test", img)
     cv.waitKey(0)
