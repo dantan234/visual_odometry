@@ -4,7 +4,7 @@ from dataset import KITTIDataset
 
 class VisualOdometry:
     """
-    A Monocular Visual Odometry pipeline for the KITTI dataset.
+    A Stereo Visual Odometry pipeline for the KITTI dataset.
     """
     def __init__(self, data_path, sequence):
         """
@@ -17,15 +17,24 @@ class VisualOdometry:
         self.dataset = KITTIDataset(data_path, sequence)
 
         # Camera Matrix for (P0) 3x4 matrix
-        self.cam_params = self.dataset.calib_matrix
-        self.focal_length = self.cam_params[0,0]
-        self.pp = (self.cam_params[0,2], self.cam_params[1,2])
+        self.K = self.dataset.P0[0:3, 0:3]
+        self.f = self.K[0,0]
+        self.cu = self.K[0,2]
+        self.cv = self.K[1,2]
+        self.B = abs(self.dataset.P1[0,3]) / self.f
+
+        # Stereo Initialization
+        self.stereo = cv.StereoSGBM_create(
+            minDisparity = 0,
+            numDisparities=64,
+            blockSize=7,
+            P1=8 * 3 * 7**2,
+            P2=32 * 3 * 7**2
+        )
         
         # State variables
-        self.old_frame = None
-        self.current_frame = None
-        self.pts_ref = None # "Reference Points" (Points in old frame)
-        self.pts_cur = None # "Current Points" (Points in new frame)
+        self.img_ref = None # Left image from t-1
+        self.pts_ref = None # "Reference Points" (Points in t-1)
         self.curr_R = np.identity(3)
         self.curr_t = np.zeros((3,1))
         
@@ -56,6 +65,55 @@ class VisualOdometry:
         else:
             scale = np.sqrt((x-x_prev)**2 + (y-y_prev)**2 + (z-z_prev)**2)
         return scale
+    
+    def get_depth(self, img_left, img_right) -> np.ndarray:
+        """
+        Computes the depth map (in meters) from a pair of images.
+
+        Args:
+            img_left: Grayscale image from camera 0.
+            img_right: Grayscale image from camera 1.
+
+        Returns:
+            np.ndarray: A 2D float32 depth map where each pixel is depth in meters.
+        """
+        disp = self.stereo.compute(img_left, img_right)
+        disparity = disp.astype(np.float32) / 16.0
+        disparity[disparity <= 0] = 0.1
+
+        depth_map = (self.f * self.B) / disparity
+        return depth_map
+    
+    def triangulate(self, pts_2d, depth_map):
+        """
+        Converts tracked 2D pixels into 3D world coordinates (in meters).
+
+        Args:
+            pts_2d: (N,2) array of [u, v] pixel coordinates from the left image.
+            depth_map: The float32 dpeth map (in meters) from get_depth.
+        """
+        pts_3d = []
+        valid_idx = []
+
+        for i, (u, v) in enumerate(pts_2d):
+            u_int, v_int = int(round(u)), int(round(v))
+            
+            # Boundary check
+            if v_int >= depth_map.shape[0] or u_int >= depth_map.shape[1] or v_int < 0 or u_int < 0:
+                continue
+
+            z = depth_map[v_int, u_int]
+            
+            # Filter out points beyond 90m or less than 1m
+            if z > 90.0 or z < 1.0:
+                continue
+
+            x = (u - self.cu) * z / self.f
+            y = (v - self.cv) * z / self.f
+
+            pts_3d.append([x,y,z])
+            valid_idx.append(i)
+        return np.array(pts_3d, dtype=np.float32), valid_idx
 
     def featureDetection(self, img) -> np.ndarray:
         """
@@ -98,63 +156,66 @@ class VisualOdometry:
 
         return valid_pts_cur, valid_pts_ref
 
-    def processFrame(self, frame_id) -> tuple[np.ndarray, np.ndarray]:
+    def processFrame(self, frame_id):
         """
         Main Loop: Loads an image, tracks features, and draws the point.
 
         Args:
             frame_id (int): The index of the frame to process
-        
-        Returns:
-            tuple[np.ndarray, np.ndarray]: A tuple containing (current_frame, display_pts)
-                    current_frame (np.ndarray): The grayscale image of the current frame for display.
-                    pts_cur (np.ndarray): The (x, y) coordinates of the successfully tracked features in the current frame.
         """
-        self.current_frame = self.dataset.get_image(frame_id)
+        img_cur = self.dataset.get_image_left(frame_id)
         
         # Initialize for frame 0
         if frame_id == 0:
             # Initialize: Just find points
-            self.old_frame = self.current_frame
-            self.pts_ref = self.featureDetection(self.current_frame)
-            return self.current_frame, self.pts_ref
+            self.img_ref = img_cur
+            self.pts_ref = self.featureDetection(img_cur)
+            return
 
         # Optical Flow Tracking
-        self.pts_cur, self.pts_ref = self.featureTracking(self.old_frame, self.current_frame, self.pts_ref)
+        pts_cur, pts_ref_valid = self.featureTracking(self.img_ref, img_cur, self.pts_ref)
 
-        # Pose Estimation
-        if len(self.pts_cur) > 10:
-            E, mask = cv.findEssentialMat(self.pts_cur, self.pts_ref, self.focal_length, self.pp, method=cv.RANSAC)
+        # Depth Estimation of ref points
+        img_ref_right = self.dataset.get_image_right(frame_id - 1)
+        depth_ref = self.get_depth(self.img_ref, img_ref_right)
 
-            _, R, t, mask = cv.recoverPose(E, self.pts_cur, self.pts_ref, focal=self.focal_length, pp=self.pp)
+        # Triangulation of ref points
+        pts_3d_ref, valid_idx = self.triangulate(pts_ref_valid, depth_ref)
+        pts_2d_cur = pts_cur[valid_idx]
 
-            absolute_scale = self.getAbsoluteScale(frame_id)
-
-            self.curr_t = self.curr_t + absolute_scale * np.dot(self.curr_R, t)
-            self.curr_R = np.dot(R, self.curr_R)
+        # Pose Estimation (PnP)
+        if len(pts_3d_ref) > 10:
+            _, rvec, t, inliers = cv.solvePnPRansac(pts_3d_ref, pts_2d_cur, self.K, None, iterationsCount=100, reprojectionError=1.0, confidence=0.99)
+            
+            if inliers is not None:
+                R_mat, _ = cv.Rodrigues(rvec)
+                R_rel = R_mat.T
+                t_rel = -R_mat.T @ t
+            
+                self.curr_t = self.curr_t + self.curr_R @ t_rel
+                self.curr_R = self.curr_R @ R_rel
 
         # Replenish Features
         # If the number of tracked points drops below 2000, detect new ones in the current frame
-        if len(self.pts_ref) < 2000:
-            new_pts = self.featureDetection(self.current_frame)
-            self.pts_cur = np.concatenate((self.pts_cur,new_pts), axis=0)
-            self.pts_ref = np.concatenate((self.pts_ref, new_pts), axis=0)
+        if len(pts_cur) < 2000:
+            new_pts = self.featureDetection(img_cur)
+            pts_cur = np.concatenate((pts_cur,new_pts), axis=0)
+
 
         # Update state for next iteration
-        self.old_frame = self.current_frame
-        self.pts_ref = self.pts_cur
-
-        return self.current_frame, self.pts_cur
+        self.img_ref = img_cur
+        self.pts_ref = pts_cur
     
-def visualize(vo_instance, frame, pts, canvas):
+def visualize(vo_instance, canvas):
     # Visualization
-    x_coord = int(vo_instance.curr_t[0,0]) + 500
-    z_coord = 500 - int(vo_instance.curr_t[2,0])
+    x_coord = int(vo_instance.curr_t[0,0]*0.75) + 500
+    z_coord = 500 - int(vo_instance.curr_t[2,0]*0.75)
     cv.circle(canvas, (x_coord,z_coord), 1, (0,255,0), 1)
     cv.imshow('Trajectory', canvas)
     
-    vis = cv.cvtColor(frame, cv.COLOR_GRAY2BGR)
-    for x, y in pts:
+    
+    vis = cv.cvtColor(vo.img_ref, cv.COLOR_GRAY2BGR)
+    for x, y in vo.pts_ref:
         cv.circle(vis, (int(x), int(y)), radius=2, color=(0,255,0), thickness=-1)
     cv.imshow('VO Pipeline', vis)
     cv.waitKey(1)
@@ -167,13 +228,15 @@ if __name__ == "__main__":
 
     # Test highway scene
     for i in range(1101):
-        frame, pts = vo.processFrame(i)
-        visualize(vo, frame, pts, traj_canvas)
+        vo.processFrame(i)
+        visualize(vo, traj_canvas)
 
+    # Reset canvas
     traj_canvas = np.zeros((1000, 1000, 3), dtype=np.uint8)
     vo.curr_R = np.identity(3)
     vo.curr_t = np.zeros((3,1))
+
     # Test neighborhood scene
     for i in range(1101,total_frames):
-        frame, pts = vo.processFrame(i)
-        visualize(vo, frame, pts, traj_canvas)
+        vo.processFrame(i)
+        visualize(vo, traj_canvas)
