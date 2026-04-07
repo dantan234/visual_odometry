@@ -37,9 +37,11 @@ class VisualOdometry:
         self.pts_ref = None # "Reference Points" (Points in t-1)
         self.curr_R = np.identity(3)
         self.curr_t = np.zeros((3,1))
-        
+        self.rvec = np.zeros((3,1))
+        self.tvec = np.array([[0],[0],[-0.1]], dtype=np.float32)
+
         # Fast Detector initialization
-        self.detector = cv.FastFeatureDetector_create(threshold=25, nonmaxSuppression=True)
+        self.detector = cv.FastFeatureDetector_create(threshold=30, nonmaxSuppression=True)
     
     def getAbsoluteScale(self, frame_id) -> float:
         """
@@ -104,8 +106,8 @@ class VisualOdometry:
 
             z = depth_map[v_int, u_int]
             
-            # Filter out points beyond 90m or less than 1m
-            if z > 90.0 or z < 1.0:
+            # Filter out points beyond 80m or less than 5m
+            if z > 100.0 or z < 2.0:
                 continue
 
             x = (u - self.cu) * z / self.f
@@ -132,6 +134,36 @@ class VisualOdometry:
 
         return key_points
     
+    def gridFeatureDetection(self, img, m=10, n=20, qty=10) -> np.ndarray:
+        """
+        Detects new features in an image using the detector by splitting the image into a m x n grid and picking points in each grid cell.
+
+        Args:
+            img (np.ndarray): Input grayscale image
+            m (int): number of grid rows
+            n (int): number of grid columns
+            qty (int): Max points to take in each grid cell
+        Returns:
+            np.ndarray: An array of shape (N,2) containing (x,y) coordinates of detected keypoints.
+        """
+
+        h, w = img.shape
+        cell_h, cell_w = h // m, w // n
+        feature_points = []
+
+        for i in range(m):
+            for j in range(n):
+                cell = img[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+
+                key_points = self.detector.detect(cell, None)
+                key_points = sorted(key_points, key=lambda x: x.response, reverse=True)[:qty]
+
+                for key_point in key_points:
+                    feature_points.append([key_point.pt[0] + j*cell_w, key_point.pt[1] + i*cell_h])
+        feature_points = np.array(feature_points, dtype=np.float32)
+
+        return feature_points
+    
     def featureTracking(self, img_ref, img_cur, pts_ref) -> tuple[np.ndarray, np.ndarray]:
         """
         Tracks features from reference frame to current frame using the Lucas-Kanade Optical Flow algorithm.
@@ -147,7 +179,7 @@ class VisualOdometry:
                 valid_pts_ref: The corresponding points from the reference image
         """
         # Find new position of points given old
-        pts_cur, status, err = cv.calcOpticalFlowPyrLK(img_ref, img_cur, pts_ref, None, winSize=(21,21), criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
+        pts_cur, status, err = cv.calcOpticalFlowPyrLK(img_ref, img_cur, pts_ref, None, winSize=(21,21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
         status = status.reshape(-1)
 
         # Filter out lost points
@@ -169,7 +201,7 @@ class VisualOdometry:
         if frame_id == 0:
             # Initialize: Just find points
             self.img_ref = img_cur
-            self.pts_ref = self.featureDetection(img_cur)
+            self.pts_ref = self.gridFeatureDetection(img_cur, qty=20)
             return
 
         # Optical Flow Tracking
@@ -183,22 +215,41 @@ class VisualOdometry:
         pts_3d_ref, valid_idx = self.triangulate(pts_ref_valid, depth_ref)
         pts_2d_cur = pts_cur[valid_idx]
 
+        R_rel, t_rel = None, None
+
         # Pose Estimation (PnP)
         if len(pts_3d_ref) > 10:
-            _, rvec, t, inliers = cv.solvePnPRansac(pts_3d_ref, pts_2d_cur, self.K, None, iterationsCount=100, reprojectionError=1.0, confidence=0.99)
+            success, rvec_new, tvec_new, inliers = cv.solvePnPRansac(pts_3d_ref, pts_2d_cur, self.K, None, 
+                                                    rvec=self.rvec,
+                                                    tvec=self.tvec,
+                                                    useExtrinsicGuess=True,
+                                                    iterationsCount=200, 
+                                                    reprojectionError=2.0, 
+                                                    confidence=0.99)
             
-            if inliers is not None:
-                R_mat, _ = cv.Rodrigues(rvec)
-                R_rel = R_mat.T
-                t_rel = -R_mat.T @ t
-            
-                self.curr_t = self.curr_t + self.curr_R @ t_rel
-                self.curr_R = self.curr_R @ R_rel
+            if success and inliers is not None:
+                R_mat, _ = cv.Rodrigues(rvec_new)
+                R_cand = R_mat.T
+                t_cand = -R_mat.T @ tvec_new
+
+                # Sanity Check for forward motion
+                if t_cand[2] > 0.0 and t_cand[2] < 5.0:
+                    R_rel, t_rel = R_cand, t_cand
+                    self.rvec, self.tvec = rvec_new, tvec_new
+
+        if R_rel is None or t_rel is None:
+            R_mat_prev, _ = cv.Rodrigues((self.rvec))
+            R_rel = R_mat_prev.T
+            t_rel = -R_mat_prev.T @ self.tvec
+        
+        # Update Pose
+        self.curr_t = self.curr_t + self.curr_R @ t_rel
+        self.curr_R = self.curr_R @ R_rel
 
         # Replenish Features
         # If the number of tracked points drops below 2000, detect new ones in the current frame
-        if len(pts_cur) < 2000:
-            new_pts = self.featureDetection(img_cur)
+        if len(pts_cur) < 4000:
+            new_pts = self.gridFeatureDetection(img_cur)
             pts_cur = np.concatenate((pts_cur,new_pts), axis=0)
 
 
