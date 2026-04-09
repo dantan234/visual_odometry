@@ -33,8 +33,8 @@ class VisualOdometry:
         )
         
         # State variables
-        self.img_ref = None # Left image from t-1
-        self.pts_ref = None # "Reference Points" (Points in t-1)
+        self.current_frame = None # Left image from t-1
+        self.current_pts = None # "Reference Points" (Points in t-1)
         self.curr_R = np.identity(3)
         self.curr_t = np.zeros((3,1))
         self.rvec = np.zeros((3,1))
@@ -107,8 +107,8 @@ class VisualOdometry:
             z = depth_map[v_int, u_int]
             
             # Filter out points beyond 80m or less than 5m
-            if z > 100.0 or z < 2.0:
-                continue
+            # if z > 100.0 or z < 2.0:
+            #     continue
 
             x = (u - self.cu) * z / self.f
             y = (v - self.cv) * z / self.f
@@ -190,26 +190,29 @@ class VisualOdometry:
 
     def processFrame(self, frame_id):
         """
-        Main Loop: Loads an image, tracks features, and draws the point.
+        Loads an image, tracks features, and estimates pose. Returns current global translation and rotation matrix.
 
         Args:
             frame_id (int): The index of the frame to process
+
+        Returns:
+            (curr_t, curr_R): Current global translation and rotation matrix.
         """
         img_cur = self.dataset.get_image_left(frame_id)
         
         # Initialize for frame 0
-        if frame_id == 0:
+        if frame_id == 0 or frame_id == 1101:
             # Initialize: Just find points
-            self.img_ref = img_cur
-            self.pts_ref = self.gridFeatureDetection(img_cur, qty=20)
-            return
+            self.current_frame = img_cur
+            self.current_pts = self.gridFeatureDetection(img_cur, qty=10)
+            return self.curr_t, self.curr_R
 
         # Optical Flow Tracking
-        pts_cur, pts_ref_valid = self.featureTracking(self.img_ref, img_cur, self.pts_ref)
+        pts_cur, pts_ref_valid = self.featureTracking(self.current_frame, img_cur, self.current_pts)
 
         # Depth Estimation of ref points
         img_ref_right = self.dataset.get_image_right(frame_id - 1)
-        depth_ref = self.get_depth(self.img_ref, img_ref_right)
+        depth_ref = self.get_depth(self.current_frame, img_ref_right)
 
         # Triangulation of ref points
         pts_3d_ref, valid_idx = self.triangulate(pts_ref_valid, depth_ref)
@@ -248,46 +251,52 @@ class VisualOdometry:
 
         # Replenish Features
         # If the number of tracked points drops below 2000, detect new ones in the current frame
-        if len(pts_cur) < 4000:
+        if len(pts_cur) < 2000:
             new_pts = self.gridFeatureDetection(img_cur)
             pts_cur = np.concatenate((pts_cur,new_pts), axis=0)
 
 
         # Update state for next iteration
-        self.img_ref = img_cur
-        self.pts_ref = pts_cur
-    
-def visualize(vo_instance, canvas):
-    # Visualization
-    x_coord = int(vo_instance.curr_t[0,0]*0.75) + 500
-    z_coord = 500 - int(vo_instance.curr_t[2,0]*0.75)
+        self.current_frame = img_cur
+        self.current_pts = pts_cur
+
+        return self.curr_t, self.curr_R
+
+def draw_trajectory(t_vec, r_mat, canvas):
+    draw_scale = 0.75
+    x_coord = int(t_vec[0,0]*draw_scale) + 500
+    z_coord = 500 - int(t_vec[2,0]*draw_scale)
     cv.circle(canvas, (x_coord,z_coord), 1, (0,255,0), 1)
     cv.imshow('Trajectory', canvas)
-    
-    
-    vis = cv.cvtColor(vo.img_ref, cv.COLOR_GRAY2BGR)
-    for x, y in vo.pts_ref:
-        cv.circle(vis, (int(x), int(y)), radius=2, color=(0,255,0), thickness=-1)
-    cv.imshow('VO Pipeline', vis)
-    cv.waitKey(1)
 
+def draw_feature_feed(vo_instance):
+    vis = cv.cvtColor(vo_instance.current_frame, cv.COLOR_GRAY2BGR)
+    for x, y in vo_instance.current_pts:
+        cv.circle(vis, (int(x), int(y)), radius=2, color=(0,255,0), thickness=-1)
+    cv.imshow('Left Camera Feed', vis)
 
 if __name__ == "__main__":
     vo = VisualOdometry('data', '00')
-    traj_canvas = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    traj_canvas = np.zeros((1200, 2000, 3), dtype=np.uint8)
     total_frames = len(vo.dataset)
 
     # Test highway scene
     for i in range(1101):
-        vo.processFrame(i)
-        visualize(vo, traj_canvas)
+        t_vec, r_mat = vo.processFrame(i)
+        draw_trajectory(t_vec, r_mat, traj_canvas)
+        draw_feature_feed(vo)
+        cv.waitKey(1)
 
     # Reset canvas
     traj_canvas = np.zeros((1000, 1000, 3), dtype=np.uint8)
     vo.curr_R = np.identity(3)
     vo.curr_t = np.zeros((3,1))
+    vo.rvec = np.zeros((3,1))
+    vo.tvec = np.array([[0],[0],[-0.1]], dtype=np.float32)
 
     # Test neighborhood scene
     for i in range(1101,total_frames):
-        vo.processFrame(i)
-        visualize(vo, traj_canvas)
+        t_vec, r_mat = vo.processFrame(i)
+        draw_trajectory(t_vec, r_mat, traj_canvas)
+        draw_feature_feed(vo)
+        cv.waitKey(1)
