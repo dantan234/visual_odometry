@@ -33,40 +33,43 @@ class VisualOdometry:
         )
         
         # State variables
-        self.current_frame = None # Left image from t-1
-        self.current_pts = None # "Reference Points" (Points in t-1)
-        self.curr_R = np.identity(3)
-        self.curr_t = np.zeros((3,1))
+        self.prev_frame = None # Left image from t-1
+        self.prev_pts = None # "Reference Points" (Points in t-1)
+        self.prev_depth = None # Depth map from t-1
+        self.global_R = np.identity(3)
+        self.global_t = np.zeros((3,1))
+
+        # Initialize Pnp Extrinsics
         self.rvec = np.zeros((3,1))
         self.tvec = np.array([[0],[0],[-0.1]], dtype=np.float32)
 
         # Fast Detector initialization
         self.detector = cv.FastFeatureDetector_create(threshold=30, nonmaxSuppression=True)
     
-    def getAbsoluteScale(self, frame_id) -> float:
-        """
-        Calculates the Euclidean distance between the current and previous ground truth poses to provide the real-world scale.
+    # def getAbsoluteScale(self, frame_id) -> float:
+    #     """
+    #     Calculates the Euclidean distance between the current and previous ground truth poses to provide the real-world scale.
         
-        Args:
-            frame_id (int): The index of the current frame
+    #     Args:
+    #         frame_id (int): The index of the current frame
 
-        Returns:
-            float: The absolute distance (scale) moved between the previous frame and current frame.
-        """
-        curr_pose = self.dataset.poses[frame_id]
-        x = curr_pose[0,3]
-        y = curr_pose[1,3]
-        z = curr_pose[2,3]
-        prev_pose = self.dataset.poses[frame_id-1]
-        x_prev = prev_pose[0,3]
-        y_prev = prev_pose[1,3]
-        z_prev = prev_pose[2,3]
+    #     Returns:
+    #         float: The absolute distance (scale) moved between the previous frame and current frame.
+    #     """
+    #     curr_pose = self.dataset.poses[frame_id]
+    #     x = curr_pose[0,3]
+    #     y = curr_pose[1,3]
+    #     z = curr_pose[2,3]
+    #     prev_pose = self.dataset.poses[frame_id-1]
+    #     x_prev = prev_pose[0,3]
+    #     y_prev = prev_pose[1,3]
+    #     z_prev = prev_pose[2,3]
 
-        if frame_id == 0:
-            return 0.0
-        else:
-            scale = np.sqrt((x-x_prev)**2 + (y-y_prev)**2 + (z-z_prev)**2)
-        return scale
+    #     if frame_id == 0:
+    #         return 0.0
+    #     else:
+    #         scale = np.sqrt((x-x_prev)**2 + (y-y_prev)**2 + (z-z_prev)**2)
+    #     return scale
     
     def get_depth(self, img_left, img_right) -> np.ndarray:
         """
@@ -88,11 +91,17 @@ class VisualOdometry:
     
     def triangulate(self, pts_2d, depth_map):
         """
-        Converts tracked 2D pixels into 3D world coordinates (in meters).
+        Converts tracked 2D pixels into 3D world coordinates (in meters) given depth map.
 
         Args:
             pts_2d: (N,2) array of [u, v] pixel coordinates from the left image.
             depth_map: The float32 dpeth map (in meters) from get_depth.
+
+        Returns:
+            (np.ndarray, List[int]): Returns a tuple containing:
+                pts_3d (np.ndarray): A (N,3) array of 3D coordinates [x,y,z]
+                valid_idx (List[int]): List of indices of the 2D points that had valid depths
+
         """
         pts_3d = []
         valid_idx = []
@@ -115,6 +124,7 @@ class VisualOdometry:
 
             pts_3d.append([x,y,z])
             valid_idx.append(i)
+
         return np.array(pts_3d, dtype=np.float32), valid_idx
 
     def featureDetection(self, img) -> np.ndarray:
@@ -187,8 +197,8 @@ class VisualOdometry:
         valid_pts_ref = pts_ref[status == 1]
 
         return valid_pts_cur, valid_pts_ref
-
-    def processFrame(self, frame_id):
+    
+    def processFrame(self, frame_id) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Loads an image, tracks features, and estimates pose. Returns current global translation and rotation matrix.
 
@@ -196,33 +206,39 @@ class VisualOdometry:
             frame_id (int): The index of the frame to process
 
         Returns:
-            (curr_t, curr_R): Current global translation and rotation matrix.
+            Tuple containing:
+                global_t (np.ndarray): (3,1) Current position in world coordinates (meters)
+                global_R (np.ndarray): (3,3) Current orientation matrix in world coordinates
+                t_rel (np.ndarray): (3,1) Instantaneous translation vector in meters
+                R_Rel (np.ndarray): (3,3) Instantaneous rotation matrix
+                curr_depth_map (np.ndarray): (H,W) Dense depth map for current frame in meters
         """
-        img_cur = self.dataset.get_image_left(frame_id)
+        curr_frame = self.dataset.get_image_left(frame_id)
+        curr_frame_right = self.dataset.get_image_right(frame_id)
+        curr_depth_map = self.get_depth(curr_frame, curr_frame_right)
         
         # Initialize for frame 0
         if frame_id == 0 or frame_id == 1101:
             # Initialize: Just find points
-            self.current_frame = img_cur
-            self.current_pts = self.gridFeatureDetection(img_cur, qty=10)
-            return self.curr_t, self.curr_R
+            self.prev_frame = curr_frame
+            self.prev_pts = self.gridFeatureDetection(curr_frame, qty=10)
+            self.prev_depth = curr_depth_map
+            return self.global_t, self.global_R, np.zeros((3,1)), np.identity(3), curr_depth_map
 
         # Optical Flow Tracking
-        pts_cur, pts_ref_valid = self.featureTracking(self.current_frame, img_cur, self.current_pts)
+        curr_pts, prev_pts = self.featureTracking(self.prev_frame, curr_frame, self.prev_pts)
 
-        # Depth Estimation of ref points
-        img_ref_right = self.dataset.get_image_right(frame_id - 1)
-        depth_ref = self.get_depth(self.current_frame, img_ref_right)
+        # Triangulation of points in previous frame
+        pts_3d_prev, valid_idx = self.triangulate(prev_pts, self.prev_depth)
+        pts_2d_curr = curr_pts[valid_idx]
 
-        # Triangulation of ref points
-        pts_3d_ref, valid_idx = self.triangulate(pts_ref_valid, depth_ref)
-        pts_2d_cur = pts_cur[valid_idx]
+        # Initially assume motion is the same as last frame
+        R_mat_prev, _ = cv.Rodrigues(self.rvec)
+        R_rel, t_rel = R_mat_prev.T, -R_mat_prev.T @ self.tvec
 
-        R_rel, t_rel = None, None
-
-        # Pose Estimation (PnP)
-        if len(pts_3d_ref) > 10:
-            success, rvec_new, tvec_new, inliers = cv.solvePnPRansac(pts_3d_ref, pts_2d_cur, self.K, None, 
+        # Pose Estimation RANSAC (PnP)
+        if len(pts_3d_prev) > 10:
+            success, rvec, tvec, inliers = cv.solvePnPRansac(pts_3d_prev, pts_2d_curr, self.K, None, 
                                                     rvec=self.rvec,
                                                     tvec=self.tvec,
                                                     useExtrinsicGuess=True,
@@ -230,48 +246,43 @@ class VisualOdometry:
                                                     reprojectionError=2.0, 
                                                     confidence=0.99)
             
+            # If RANSAC finds a solution, use that relative motion vector
             if success and inliers is not None:
-                R_mat, _ = cv.Rodrigues(rvec_new)
+                R_mat, _ = cv.Rodrigues(rvec)
                 R_cand = R_mat.T
-                t_cand = -R_mat.T @ tvec_new
+                t_cand = -R_mat.T @ tvec
 
                 # Sanity Check for forward motion
                 if t_cand[2] > 0.0 and t_cand[2] < 5.0:
                     R_rel, t_rel = R_cand, t_cand
-                    self.rvec, self.tvec = rvec_new, tvec_new
-
-        if R_rel is None or t_rel is None:
-            R_mat_prev, _ = cv.Rodrigues((self.rvec))
-            R_rel = R_mat_prev.T
-            t_rel = -R_mat_prev.T @ self.tvec
+                    self.rvec, self.tvec = rvec, tvec
         
-        # Update Pose
-        self.curr_t = self.curr_t + self.curr_R @ t_rel
-        self.curr_R = self.curr_R @ R_rel
+        # Update Global Pose
+        self.global_t = self.global_t + self.global_R @ t_rel
+        self.global_R = self.global_R @ R_rel
 
         # Replenish Features
         # If the number of tracked points drops below 2000, detect new ones in the current frame
-        if len(pts_cur) < 2000:
-            new_pts = self.gridFeatureDetection(img_cur)
-            pts_cur = np.concatenate((pts_cur,new_pts), axis=0)
-
+        if len(curr_pts) < 2000:
+            new_pts = self.gridFeatureDetection(curr_frame)
+            curr_pts = np.concatenate((curr_pts,new_pts), axis=0)
 
         # Update state for next iteration
-        self.current_frame = img_cur
-        self.current_pts = pts_cur
+        self.prev_frame = curr_frame
+        self.prev_pts = curr_pts
 
-        return self.curr_t, self.curr_R
+        return self.global_t, self.global_R, t_rel, R_rel, curr_depth_map
 
-def draw_trajectory(t_vec, r_mat, canvas):
+def draw_trajectory(t_vec, canvas, color=(0, 255, 0), r_mat=None):
     draw_scale = 0.75
     x_coord = int(t_vec[0,0]*draw_scale) + 500
     z_coord = 500 - int(t_vec[2,0]*draw_scale)
-    cv.circle(canvas, (x_coord,z_coord), 1, (0,255,0), 1)
+    cv.circle(canvas, (x_coord,z_coord), 1, color, 1)
     cv.imshow('Trajectory', canvas)
 
 def draw_feature_feed(vo_instance):
-    vis = cv.cvtColor(vo_instance.current_frame, cv.COLOR_GRAY2BGR)
-    for x, y in vo_instance.current_pts:
+    vis = cv.cvtColor(vo_instance.prev_frame, cv.COLOR_GRAY2BGR)
+    for x, y in vo_instance.prev_pts:
         cv.circle(vis, (int(x), int(y)), radius=2, color=(0,255,0), thickness=-1)
     cv.imshow('Left Camera Feed', vis)
 
@@ -280,23 +291,31 @@ if __name__ == "__main__":
     traj_canvas = np.zeros((1200, 2000, 3), dtype=np.uint8)
     total_frames = len(vo.dataset)
 
-    # Test highway scene
-    for i in range(1101):
-        t_vec, r_mat = vo.processFrame(i)
-        draw_trajectory(t_vec, r_mat, traj_canvas)
+    # Test sequence 00
+    for i in range(total_frames):
+        t_vec, r_mat, t_rel, R_Rel, depth_map = vo.processFrame(i)
+        gt_pose = vo.dataset.poses[i]
+        gt_t_vec = gt_pose[:,3].reshape(3,1)
+
+        draw_trajectory(t_vec, traj_canvas, color=(0,255,0))
+        draw_trajectory(gt_t_vec, traj_canvas, color=(0,0,255))
         draw_feature_feed(vo)
         cv.waitKey(1)
 
-    # Reset canvas
-    traj_canvas = np.zeros((1000, 1000, 3), dtype=np.uint8)
-    vo.curr_R = np.identity(3)
-    vo.curr_t = np.zeros((3,1))
-    vo.rvec = np.zeros((3,1))
-    vo.tvec = np.array([[0],[0],[-0.1]], dtype=np.float32)
+    # # Reset canvas
+    # traj_canvas = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    # vo.curr_R = np.identity(3)
+    # vo.curr_t = np.zeros((3,1))
+    # vo.rvec = np.zeros((3,1))
+    # vo.tvec = np.array([[0],[0],[-0.1]], dtype=np.float32)
 
-    # Test neighborhood scene
-    for i in range(1101,total_frames):
-        t_vec, r_mat = vo.processFrame(i)
-        draw_trajectory(t_vec, r_mat, traj_canvas)
-        draw_feature_feed(vo)
-        cv.waitKey(1)
+    # # Test neighborhood scene
+    # for i in range(1101,total_frames):
+    #     t_vec, r_mat = vo.processFrame(i)
+    #     gt_pose = vo.dataset.poses[i]
+    #     gt_t_vec = gt_pose[:,3].reshape(3,1)
+
+    #     draw_trajectory(t_vec, traj_canvas, color=(0,255,0))
+    #     draw_trajectory(gt_t_vec, traj_canvas, color=(0,0,255))
+    #     draw_feature_feed(vo)
+    #     cv.waitKey(1)
